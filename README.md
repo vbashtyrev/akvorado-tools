@@ -2,13 +2,13 @@
 
 Утилиты для работы с Akvorado (ClickHouse): сравнение перцентиля с Zabbix, только Akvorado, удаление данных за период.
 
-Подключение к ClickHouse по SSH-туннелю (порт 8123 на удалённом хосте пробрасывается локально).
+ClickHouse работает в Docker-контейнере; порт HTTP (8123) примаплен с контейнера на хост. Подключение к ClickHouse — по SSH-туннелю: с локальной машины туннель пробрасывает порт хоста (8123) к себе, запросы идут в ClickHouse через этот туннель.
 
 ## Требования
 
 - Python 3.6+
 - `requests`
-- SSH-доступ к хосту Akvorado (ключ по умолчанию `~/.ssh/proCloud`)
+- SSH-доступ к хосту, где запущен Docker с ClickHouse (ключ задаётся через `--akvorado-key`)
 - Для режима Zabbix / сравнения: `ZABBIX_URL`, `ZABBIX_TOKEN`
 
 ```bash
@@ -53,7 +53,7 @@ python zabbix_percentile.py --akvorado-discover-boundary
 python zabbix_percentile.py --akvorado-only --akvorado-boundary-only --akvorado-all-tables --from 202602170805 --to 202602170905
 
 # Zabbix + сравнение с Akvorado (нужны ZABBIX_URL, ZABBIX_TOKEN)
-python zabbix_percentile.py --host MSK-M9-MX204-1 --interface 635 --from 20260101 --to 20260201 --akvorado
+python zabbix_percentile.py --host HOST --interface 635 --from 20260101 --to 20260201 --akvorado
 ```
 
 ---
