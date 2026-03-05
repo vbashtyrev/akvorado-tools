@@ -108,14 +108,47 @@ def interface_name_from_item_name(name):
     return m.group(1).strip() if m else None
 
 
-def get_host_and_item(url, token, host_name, item_key, debug=False):
-    """Найти hostid по имени и itemid по ключу. Возврат (hostid, itemid, item_name, err)."""
+def get_item_by_interface_name(url, token, hostid, interface_name, direction="in", debug=False):
+    """
+    Найти item по имени интерфейса в названии item (например "ae5" для "Interface ae5(Beeline): Bits received").
+    Ищет только item'ы трафика (octets): ключ должен содержать ifHCInOctets (in) или ifHCOutOctets (out),
+    чтобы не взять discards/errors и т.п.
+    Возврат (itemid, key_, name) или (None, None, None).
+    """
+    key_substr = "net.if.in" if direction == "in" else "net.if.out"
+    octets_substr = "ifHCInOctets" if direction == "in" else "ifHCOutOctets"
+    result, err = zabbix_request(url, token, "item.get", {
+        "output": ["itemid", "key_", "name"],
+        "hostids": [hostid],
+        "search": {"key_": key_substr},
+        "searchByAny": False,
+    }, debug=debug)
+    if err or not result:
+        return None, None, None
+    iface_lower = (interface_name or "").strip().lower()
+    for item in result:
+        key_ = item.get("key_") or ""
+        if octets_substr not in key_:
+            continue
+        name = item.get("name") or ""
+        extracted = interface_name_from_item_name(name)
+        if extracted and extracted.strip().lower() == iface_lower:
+            return item["itemid"], key_, name
+    return None, None, None
+
+
+def get_host_and_item(url, token, host_name, item_key, interface_name=None, direction="in", debug=False):
+    """
+    Найти hostid по имени и itemid по ключу (или по имени интерфейса в названии item).
+    interface_name: при неудаче поиска по ключу ищется item, у которого в name фигурирует этот интерфейс (например ae5).
+    Возврат (hostid, itemid, item_name, resolved_key, err). resolved_key — фактический ключ item (для вывода).
+    """
     result, err = zabbix_request(url, token, "host.get", {
         "output": ["hostid", "host"],
         "filter": {"host": [host_name]},
     }, debug=debug)
     if err:
-        return None, None, None, err
+        return None, None, None, None, err
     if not result:
         # попробовать по visible name (name)
         result, err = zabbix_request(url, token, "host.get", {
@@ -124,7 +157,7 @@ def get_host_and_item(url, token, host_name, item_key, debug=False):
             "searchByAny": True,
         }, debug=debug)
         if err or not result:
-            return None, None, None, "хост не найден: {}".format(host_name)
+            return None, None, None, None, "хост не найден: {}".format(host_name)
     hostid = result[0]["hostid"]
 
     result, err = zabbix_request(url, token, "item.get", {
@@ -134,11 +167,23 @@ def get_host_and_item(url, token, host_name, item_key, debug=False):
         "searchByAny": False,
     }, debug=debug)
     if err:
-        return hostid, None, None, err
-    if not result:
-        return hostid, None, None, "item не найден: key_={}".format(item_key)
-    item = result[0]
-    return hostid, item["itemid"], item.get("name") or "", None
+        return hostid, None, None, None, err
+    if result:
+        item = result[0]
+        key_used = item.get("key_") or item_key
+        return hostid, item["itemid"], item.get("name") or "", key_used, None
+
+    # По ключу не нашли — если передан interface_name (например ae5), ищем по названию item
+    if interface_name:
+        itemid, found_key, found_name = get_item_by_interface_name(
+            url, token, hostid, interface_name, direction=direction, debug=debug
+        )
+        if itemid is not None:
+            if debug:
+                print("  item найден по имени интерфейса: key_={}".format(found_key), file=sys.stderr)
+            return hostid, itemid, found_name, found_key or item_key, None
+
+    return hostid, None, None, None, "item не найден: key_={}".format(item_key)
 
 
 def fetch_history(url, token, itemid, time_from, time_till, history_type=3, limit=100000, debug=False):
@@ -321,12 +366,22 @@ def fetch_akvorado_bps(ssh_host, ssh_user, key_path, exporter_name, in_if_name, 
                     row = r2.text.strip().split("\t")
                     if len(row) >= 3:
                         c, tmin, tmax = row[0], row[1], row[2]
-                        # Данные в таблице только в диапазоне [tmin, tmax]; запрошенный период может не пересекаться
-                        diag_msg = (
-                            "в таблице записей={}, данные только за период min(TimeReceived)={}, max(TimeReceived)={}. "
-                            "Запрошенный период ({} — {}) не пересекается с этим диапазоном. "
-                            "Укажите --from / --to в пределах данных, например для февраля: --from 20260202 --to 20260218."
-                        ).format(c, tmin, tmax, from_dt[:10], to_dt[:10])
+                        try:
+                            c_int = int(c)
+                        except ValueError:
+                            c_int = 0
+                        if c_int == 0:
+                            diag_msg = (
+                                "в таблице записей=0 для указанных ExporterName/InIfName. "
+                                "В ClickHouse имена могут отличаться: проверьте ExporterName (например без префикса internet@: --akvorado-exporter msk-m9-mx204-1) и список таблиц с данными: "
+                                "--akvorado-discover --host HOST --akvorado-in-if ae5.0"
+                            )
+                        else:
+                            diag_msg = (
+                                "в таблице записей={}, данные только за период min(TimeReceived)={}, max(TimeReceived)={}. "
+                                "Запрошенный период ({} — {}) не пересекается с этим диапазоном. "
+                                "Укажите --from / --to в пределах данных или используйте --akvorado-table default.flows_5m0s --akvorado-interval 300."
+                            ).format(c, tmin, tmax, from_dt[:10], to_dt[:10])
                     else:
                         diag_msg = "ответ диагностики: " + r2.text.strip()[:200]
                 else:
@@ -363,6 +418,49 @@ def _ch_post(url, sql, timeout=60):
         return r.text, None
     except Exception as e:
         return None, str(e)
+
+
+def list_exporter_names(ssh_host, ssh_user, key_path, table_name="default.flows_5m0s", limit=80, local_port=18123):
+    """
+    Получить список уникальных ExporterName из таблицы ClickHouse (через SSH-туннель).
+    Возврат (list of str, error). Таблица должна содержать колонку ExporterName.
+    """
+    if _requests is None:
+        return None, "нужен requests"
+    key_path = os.path.expanduser(key_path)
+    if not os.path.isfile(key_path):
+        return None, "ключ SSH не найден: {}".format(key_path)
+    if "." in table_name and not table_name.startswith("."):
+        parts = table_name.split(".", 1)
+        tbl_sql = "`{}`.`{}`".format(parts[0].replace("`", "``"), parts[1].replace("`", "``"))
+    else:
+        tbl_sql = "`{}`".format(table_name.replace("`", "``"))
+    tunnel_cmd = [
+        "ssh", "-N", "-o", "ExitOnForwardFailure=yes",
+        "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+        "-L", "{}:127.0.0.1:8123".format(local_port),
+        "-i", key_path, "{}@{}".format(ssh_user, ssh_host),
+    ]
+    proc = subprocess.Popen(tunnel_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    time.sleep(1.5)
+    if proc.poll() is not None:
+        err = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
+        return None, "SSH-туннель не поднялся: {}".format(err.strip() or "ssh завершился")
+    url = "http://127.0.0.1:{}/".format(local_port)
+    try:
+        sql = "SELECT DISTINCT ExporterName FROM {} ORDER BY ExporterName LIMIT {} FORMAT TabSeparated".format(tbl_sql, limit)
+        out, err = _ch_post(url, sql, timeout=30)
+        if err:
+            return None, err
+        names = [line.strip() for line in out.strip().splitlines() if line.strip()]
+        return names, None
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
 
 def discover_akvorado_tables(ssh_host, ssh_user, key_path, exporter_name, in_if_name, local_port=18123):
@@ -542,36 +640,61 @@ def _interval_from_table_name(table_name):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="95%% перцентиль по истории item'а Zabbix за период (ZABBIX_URL, ZABBIX_TOKEN)."
+        description="95%% перцентиль по истории item'а Zabbix за период. Режимы: расчёт по Zabbix (обязательны --host, --interface или --key, --from, --to); опционально --akvorado для сравнения с ClickHouse.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Режимы работы:
+  По умолчанию     Zabbix: перцентиль по item (обязательны --host, --interface или --key, --from, --to).
+  --akvorado       То же + сравнение с Akvorado (обязательны --akvorado-host и при необходимости --akvorado-table, --akvorado-interval).
+  --akvorado-only  Только Akvorado (обязательны --akvorado-host, --from, --to и --akvorado-boundary-only либо --akvorado-in-if + --host/--akvorado-exporter).
+  --akvorado-discover
+                   Список таблиц с данными по ExporterName/InIfName (обязательны --akvorado-host, --akvorado-in-if и --host или --akvorado-exporter).
+  --akvorado-discover-boundary
+                   Список таблиц с InIfBoundary=external (обязателен только --akvorado-host; --host/--interface не используются).
+
+Переменные окружения: ZABBIX_URL, ZABBIX_TOKEN (для режимов с Zabbix).
+"""
     )
-    ap.add_argument("--host", metavar="HOST", help="Имя хоста в Zabbix (обязателен без --akvorado-only)")
-    ap.add_argument("--interface", metavar="INDEX", help="Индекс интерфейса (например 635). Строит ключ net.if.in[ifHCInOctets.INDEX]")
-    ap.add_argument("--direction", choices=("in", "out"), default="in", help="Направление: in (приём) или out (передача)")
-    ap.add_argument("--key", metavar="KEY", help="Ключ item'а целиком (если задан, --interface и --direction игнорируются)")
-    ap.add_argument("--from", dest="date_from", metavar="FROM", help="Начало периода: YYYYMMDD или YYYYMMDDHHMM или YYYYMMDDHHMMSS (например 20260101 или 202601011200)")
-    ap.add_argument("--to", dest="date_to", metavar="TO", help="Конец периода: YYYYMMDD или YYYYMMDDHHMM или YYYYMMDDHHMMSS (например 20260201)")
-    ap.add_argument("--percentile", type=float, default=95.0, help="Перцентиль (по умолчанию 95)")
-    ap.add_argument("--akvorado", action="store_true", help="Сравнить с Akvorado (ClickHouse по SSH)")
-    ap.add_argument("--akvorado-only", action="store_true", help="Только Akvorado: запрос и вывод без Zabbix (нужны --from, --to и --akvorado-boundary-only или --akvorado-in-if)")
-    ap.add_argument("--akvorado-host", default="msk-akvorado", metavar="HOST", help="Хост Akvorado (SSH)")
-    ap.add_argument("--akvorado-user", default="bvs", metavar="USER", help="Пользователь SSH")
-    ap.add_argument("--akvorado-key", default="~/.ssh/proCloud", metavar="PATH", help="Путь к ключу SSH")
-    ap.add_argument("--akvorado-exporter", metavar="NAME", help="ExporterName в ClickHouse (по умолчанию internet@HOST)")
-    ap.add_argument("--akvorado-in-if", metavar="NAME", help="InIfName в ClickHouse (по умолчанию INTERFACE.0, например ae5.0)")
-    ap.add_argument("--akvorado-port", type=int, default=18123, metavar="PORT", help="Локальный порт для SSH-туннеля к ClickHouse (по умолчанию 18123)")
-    ap.add_argument("--akvorado-no-boundary", action="store_true", help="Не фильтровать по InIfBoundary (по умолчанию InIfBoundary = 'external', как в UI)")
-    ap.add_argument("--akvorado-boundary-only", action="store_true", help="Только InIfBoundary = external (без ExporterName/InIfName), как в UI «InIfBoundary = external»")
-    ap.add_argument("--akvorado-tz-local", action="store_true", help="Время периода — локальное время сервера ClickHouse (иначе UTC)")
-    ap.add_argument("--akvorado-discover", action="store_true", help="Найти таблицы ClickHouse с данными по ExporterName/InIfName (нужны --host и --akvorado-in-if)")
-    ap.add_argument("--akvorado-discover-boundary", action="store_true", help="Найти все таблицы с InIfBoundary=external и вывести по каждой: записей, min/max TimeReceived")
-    ap.add_argument("--akvorado-all-tables", action="store_true", help="С --akvorado-only --akvorado-boundary-only: запрос по каждой таблице и вывод перцентиля по каждой")
-    ap.add_argument("--akvorado-table", metavar="DB.TABLE", help="Таблица ClickHouse (например default.flows_5m0s для данных за январь)")
-    ap.add_argument("--akvorado-interval", type=int, default=60, metavar="SEC", help="Окно агрегации таблицы в секундах: 60 (1min), 300 (5m), 3600 (1h). Для flows_5m0s укажите 300, для flows_1h0m0s — 3600")
-    ap.add_argument("--check-gaps", action="store_true", help="Проверить непрерывность данных за период; вывести все пропуски (когда данных нет)")
-    ap.add_argument("--check-gaps-interval", type=int, default=180, metavar="SEC", help="Ожидаемый интервал опроса Zabbix в секундах (по умолчанию 180 = 3 мин)")
-    ap.add_argument("--debug", action="store_true", help="Отладочный вывод")
+    g_zabbix = ap.add_argument_group("Zabbix и период (основной режим)")
+    g_zabbix.add_argument("--host", metavar="HOST", help="Имя хоста в Zabbix. Обязателен, кроме --akvorado-only и --akvorado-discover-boundary.")
+    g_zabbix.add_argument("--interface", metavar="NAME_OR_INDEX", help="Интерфейс: имя (ae5) или SNMP-индекс (635). Обязателен, если не задан --key.")
+    g_zabbix.add_argument("--key", metavar="KEY", help="Ключ item целиком; если задан, --interface и --direction не используются.")
+    g_zabbix.add_argument("--direction", choices=("in", "out"), default="in", help="Направление трафика (по умолчанию in).")
+    g_zabbix.add_argument("--from", dest="date_from", metavar="FROM", help="Начало периода: YYYYMMDD или YYYYMMDDHHMM(SS). Обязателен для расчёта перцентиля.")
+    g_zabbix.add_argument("--to", dest="date_to", metavar="TO", help="Конец периода: YYYYMMDD или YYYYMMDDHHMM(SS). Обязателен для расчёта перцентиля.")
+    g_zabbix.add_argument("--percentile", type=float, default=95.0, help="Перцентиль, 0–100 (по умолчанию 95).")
+
+    g_akv_mode = ap.add_argument_group("Режимы Akvorado (взаимоисключающие по смыслу)")
+    g_akv_mode.add_argument("--akvorado", action="store_true", help="Добавить к выводу сравнение с Akvorado (Zabbix остаётся основным).")
+    g_akv_mode.add_argument("--akvorado-only", action="store_true", help="Только Akvorado, без Zabbix. Нужны --from, --to и (--akvorado-boundary-only либо --akvorado-in-if + --host или --akvorado-exporter).")
+    g_akv_mode.add_argument("--akvorado-discover", action="store_true", help="Показать таблицы с данными по ExporterName/InIfName. Нужны --akvorado-in-if и --host или --akvorado-exporter.")
+    g_akv_mode.add_argument("--akvorado-discover-boundary", action="store_true", help="Показать таблицы с InIfBoundary=external (без фильтра по хосту/интерфейсу).")
+
+    g_akv_conn = ap.add_argument_group("Подключение к Akvorado (обязательно для любого режима с Akvorado)")
+    g_akv_conn.add_argument("--akvorado-host", metavar="HOST", help="Хост Akvorado для SSH. Обязателен при --akvorado, --akvorado-only, --akvorado-discover, --akvorado-discover-boundary.")
+    g_akv_conn.add_argument("--akvorado-user", default="bvs", metavar="USER", help="Пользователь SSH (по умолчанию bvs).")
+    g_akv_conn.add_argument("--akvorado-key", default="~/.ssh/proCloud", metavar="PATH", help="Путь к ключу SSH.")
+    g_akv_conn.add_argument("--akvorado-port", type=int, default=18123, metavar="PORT", help="Локальный порт туннеля к ClickHouse (по умолчанию 18123).")
+
+    g_akv_query = ap.add_argument_group("Параметры запроса Akvorado (по умолчанию — из --host/--interface)")
+    g_akv_query.add_argument("--akvorado-exporter", metavar="NAME", help="ExporterName в ClickHouse (по умолчанию internet@<host>).")
+    g_akv_query.add_argument("--akvorado-in-if", metavar="NAME", help="InIfName в ClickHouse (по умолчанию <interface>.0, например ae5.0).")
+    g_akv_query.add_argument("--akvorado-table", metavar="DB.TABLE", help="Таблица (по умолчанию flows). Для длинных периодов: default.flows_5m0s.")
+    g_akv_query.add_argument("--akvorado-interval", type=int, default=60, metavar="SEC", help="Окно агрегации в секундах: 60, 300 (5m), 3600 (1h). Для flows_5m0s укажите 300.")
+    g_akv_query.add_argument("--akvorado-boundary-only", action="store_true", help="Фильтр только InIfBoundary=external (без ExporterName/InIfName).")
+    g_akv_query.add_argument("--akvorado-no-boundary", action="store_true", help="Не фильтровать по InIfBoundary.")
+    g_akv_query.add_argument("--akvorado-tz-local", action="store_true", help="Время периода — локальное время сервера ClickHouse (иначе UTC).")
+    g_akv_query.add_argument("--akvorado-all-tables", action="store_true", help="С --akvorado-only --akvorado-boundary-only: запрос по каждой найденной таблице.")
+
+    g_other = ap.add_argument_group("Прочее")
+    g_other.add_argument("--check-gaps", action="store_true", help="Проверить непрерывность данных; вывести пропуски.")
+    g_other.add_argument("--check-gaps-interval", type=int, default=180, metavar="SEC", help="Ожидаемый интервал опроса Zabbix в секундах (по умолчанию 180).")
+    g_other.add_argument("--debug", action="store_true", help="Отладочный вывод.")
     args = ap.parse_args()
 
+    if args.akvorado or args.akvorado_only or args.akvorado_discover or args.akvorado_discover_boundary:
+        if not args.akvorado_host:
+            ap.error("Укажите --akvorado-host (хост Akvorado для SSH)")
     if not args.akvorado_only and not args.akvorado_discover_boundary and not args.host:
         ap.error("Укажите --host (или используйте --akvorado-only / --akvorado-discover-boundary)")
 
@@ -690,7 +813,7 @@ def main():
             print("Ошибка: {}".format(err), file=sys.stderr)
             return 1
         found.sort(key=lambda r: (r.get("database") or "", r.get("table") or ""))
-        print("Таблицы с InIfBoundary = 'external':")
+        print("Таблицы с InIfBoundary = 'external' (фильтр только по boundary, без ExporterName/InIfName):")
         print("")
         for r in found:
             tbl = "{}.{}".format(r["database"], r["table"])
@@ -723,15 +846,40 @@ def main():
         print("Таблицы с ExporterName={}, InIfName={}:".format(exporter, args.akvorado_in_if))
         print("")
         for r in found:
+            tbl = "{}.{}".format(r["database"], r["table"])
             if r.get("error"):
-                print("  {}.\t{}\tошибка: {}".format(r["database"], r["table"], r["error"]))
+                print("  {}\tошибка: {}".format(tbl, r["error"]))
             else:
                 c = r.get("count") if r.get("count") is not None else 0
-                print("  {}.\t{}\t(time: {})  записей={}  min={}  max={}".format(
-                    r["database"], r["table"], r["time_col"], c, r.get("min_t") or "—", r.get("max_t") or "—"))
+                print("  {}\t(time: {})  записей={}  min={}  max={}".format(
+                    tbl, r["time_col"], c, r.get("min_t") or "—", r.get("max_t") or "—"))
         if not found:
             print("  (нет подходящих таблиц с колонками ExporterName, InIfName, Bytes, TimeReceived/TimeFlow)")
         else:
+            n_with_data = sum(1 for r in found if (r.get("count") or 0) > 0)
+            if n_with_data == 0:
+                print("")
+                print("Для указанных ExporterName/InIfName записей нет ни в одной таблице.")
+                exporters, list_err = list_exporter_names(
+                    args.akvorado_host, args.akvorado_user, args.akvorado_key,
+                    table_name="default.flows_5m0s", limit=50, local_port=args.akvorado_port,
+                )
+                if list_err:
+                    print("Узнать имена экспортеров не удалось: {}.".format(list_err))
+                elif exporters:
+                    subset = [e for e in exporters if args.host and args.host in e]
+                    if subset:
+                        print("ExporterName, содержащие ваш хост ({}): {}".format(args.host, ", ".join(subset[:15])))
+                        if len(subset) > 15:
+                            print("  ... и ещё {} (всего в таблице: {})".format(len(subset) - 15, len(exporters)))
+                    else:
+                        print("Примеры ExporterName в default.flows_5m0s (первые 20): {}".format(", ".join(exporters[:20])))
+                    if len(exporters) > 20:
+                        print("  ... всего в выборке {} уникальных имён. Укажите --akvorado-exporter одно из них.".format(len(exporters)))
+                    else:
+                        print("Укажите --akvorado-exporter одно из значений выше.")
+                else:
+                    print("В таблице default.flows_5m0s нет колонки ExporterName или она пуста.")
             print("")
             print("Для данных за январь используйте агрегированные таблицы (flows_5m0s или flows_1h0m0s):")
             print("  --akvorado-table default.flows_5m0s --akvorado-interval 300")
@@ -767,10 +915,17 @@ def main():
         print("--from должно быть раньше --to", file=sys.stderr)
         return 1
 
-    hostid, itemid, item_name, err = get_host_and_item(url, token, args.host, item_key, debug=args.debug)
+    hostid, itemid, item_name, resolved_key, err = get_host_and_item(
+        url, token, args.host, item_key,
+        interface_name=args.interface if not args.key else None,
+        direction=args.direction,
+        debug=args.debug,
+    )
     if err:
         print(err, file=sys.stderr)
         return 1
+    if resolved_key:
+        item_key = resolved_key
     interface_label = interface_name_from_item_name(item_name) if item_name else None
     if args.debug:
         print("hostid={}, itemid={}, item name={}".format(hostid, itemid, item_name), file=sys.stderr)

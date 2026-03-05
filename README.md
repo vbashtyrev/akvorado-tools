@@ -19,41 +19,56 @@ pip install -r requirements.txt
 
 ## 1. `zabbix_percentile.py` — перцентиль и сравнение
 
-95% перцентиль по истории Zabbix за период; опционально сравнение с Akvorado; режим «только Akvorado» без Zabbix.
+95% перцентиль по истории Zabbix за период; опционально сравнение с Akvorado; режимы «только Akvorado» и discover таблиц.
 
-### Режимы
+### Режимы работы
 
-| Режим | Описание |
-|-------|----------|
-| Zabbix | `--host`, `--from`, `--to`, `--interface` или `--key` — перцентиль по item'у Zabbix |
-| Zabbix + Akvorado | + `--akvorado` — тот же период, вывод Zabbix и Akvorado, сравнение |
-| Только Akvorado | `--akvorado-only --akvorado-boundary-only` (или `--akvorado-in-if`) + `--from` / `--to` — без Zabbix |
-| Discover таблиц | `--akvorado-discover-boundary` — список таблиц с InIfBoundary=external и min/max времени |
-| По всем таблицам | `--akvorado-only --akvorado-boundary-only --akvorado-all-tables` — перцентиль по каждой таблице |
+| Режим | Как включить | Обязательные опции |
+|-------|--------------|---------------------|
+| **Zabbix** | по умолчанию | `--host`, `--interface` или `--key`, `--from`, `--to` |
+| **Zabbix + Akvorado** | `--akvorado` | то же + `--akvorado-host`; при необходимости `--akvorado-table`, `--akvorado-interval`, `--akvorado-exporter` |
+| **Только Akvorado** | `--akvorado-only` | `--akvorado-host`, `--from`, `--to` и либо `--akvorado-boundary-only`, либо `--akvorado-in-if` + (`--host` или `--akvorado-exporter`) |
+| **Discover по ExporterName/InIfName** | `--akvorado-discover` | `--akvorado-host`, `--akvorado-in-if`, и `--host` или `--akvorado-exporter` |
+| **Discover таблиц (boundary)** | `--akvorado-discover-boundary` | только `--akvorado-host`; список таблиц с InIfBoundary=external, без фильтра по хосту/интерфейсу |
+| **По всем таблицам** | `--akvorado-only --akvorado-boundary-only --akvorado-all-tables` | `--akvorado-host`, `--from`, `--to` — перцентиль по каждой таблице |
 
-### Основные ключи
+Полный список опций по разделам: `python3 zabbix_percentile.py --help`.
 
-- `--host` — хост в Zabbix (обязателен без `--akvorado-only` / `--akvorado-discover-boundary`)
-- `--from`, `--to` — период (YYYYMMDD или YYYYMMDDHHMM)
-- `--interface` / `--key` — интерфейс или ключ item'а
-- `--akvorado-boundary-only` — только InIfBoundary = external (без ExporterName/InIfName)
-- `--akvorado-table` — таблица ClickHouse (например `default.flows_5m0s`)
-- `--akvorado-discover` — таблицы по ExporterName/InIfName (нужны `--host`, `--akvorado-in-if`)
+### Важные опции
+
+- **`--akvorado-host`** — хост Akvorado для SSH. **Обязателен** при любом режиме с Akvorado (дефолта нет).
+- **`--host`** — хост в Zabbix; для Akvorado по умолчанию ExporterName = `internet@<host>` (регистр в ClickHouse сохраняется).
+- **`--interface`** — имя интерфейса (например `ae5`) или SNMP-индекс (например `635`). При имени ищется item по названию в Zabbix (например «Interface ae5(Beeline): Bits received»).
+- **`--from`**, **`--to`** — период (YYYYMMDD или YYYYMMDDHHMM).
+- **`--akvorado-exporter`** — ExporterName в ClickHouse. Если в UI отображается `internet@MSK-M9-MX204-1`, укажите именно так (регистр важен).
+- **`--akvorado-in-if`** — InIfName в ClickHouse (например `ae5.0`).
+- **`--akvorado-table`** — таблица (по умолчанию `flows`). Для длинных периодов: `default.flows_5m0s`.
+- **`--akvorado-interval`** — окно агрегации в секундах: 60, 300 (5m), 3600 (1h). Для `flows_5m0s` укажите 300.
 
 ### Примеры
 
 ```bash
-# Только Akvorado, InIfBoundary=external
-python zabbix_percentile.py --akvorado-only --akvorado-boundary-only --from 202602170805 --to 202602170905
+# Только Akvorado, InIfBoundary=external (без ExporterName/InIfName)
+python3 zabbix_percentile.py --akvorado-only --akvorado-boundary-only \
+  --akvorado-host msk-akvorado --from 20260201 --to 20260301
 
-# Список таблиц и min/max по каждой
-python zabbix_percentile.py --akvorado-discover-boundary
+# Только Akvorado по конкретному интерфейсу (как в UI: InIfName + ExporterName)
+python3 zabbix_percentile.py --akvorado-only --akvorado-host msk-akvorado \
+  --from 20260201 --to 20260301 \
+  --akvorado-exporter "internet@MSK-M9-MX204-1" --akvorado-in-if ae5.0 \
+  --akvorado-table default.flows_5m0s --akvorado-interval 300
 
-# Перцентиль по каждой таблице за период
-python zabbix_percentile.py --akvorado-only --akvorado-boundary-only --akvorado-all-tables --from 202602170805 --to 202602170905
+# Список таблиц с InIfBoundary=external (--host не используется)
+python3 zabbix_percentile.py --akvorado-discover-boundary --akvorado-host msk-akvorado
 
-# Zabbix + сравнение с Akvorado (нужны ZABBIX_URL, ZABBIX_TOKEN)
-python zabbix_percentile.py --host HOST --interface 635 --from 20260101 --to 20260201 --akvorado
+# Таблицы, где есть данные по ExporterName/InIfName (если 0 записей — скрипт выведет примеры ExporterName из ClickHouse)
+python3 zabbix_percentile.py --akvorado-discover --akvorado-host msk-akvorado \
+  --akvorado-in-if ae5.0 --akvorado-exporter "internet@MSK-M9-MX204-1"
+
+# Zabbix + сравнение с Akvorado (ZABBIX_URL, ZABBIX_TOKEN обязательны)
+python3 zabbix_percentile.py --host msk-m9-mx204-1 --interface ae5 --direction in \
+  --from 20260201 --to 20260301 --akvorado --akvorado-host msk-akvorado \
+  --akvorado-exporter "internet@MSK-M9-MX204-1" --akvorado-table default.flows_5m0s --akvorado-interval 300
 ```
 
 ---
